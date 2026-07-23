@@ -199,65 +199,16 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
           if (-not (Test-Path $out)) { Write-Host "❌ Download failed"; exit 1 }
 
-      - name: Download LibreOffice installer
+      - name: Prepare libreoffice folder (user installs manually)
         shell: pwsh
         run: |
-          $url = "https://download.documentfoundation.org/libreoffice/stable/26.2.4/win/x86_64/LibreOffice_26.2.4_Win_x86-64.msi"
-          $out = "installers\libreoffice\LibreOffice_26.2.4_Win_x86-64.msi"
-          New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
-          Write-Host "Downloading LibreOffice 26.2.4..."
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -TimeoutSec 300
-          if (-not (Test-Path $out)) { Write-Host "❌ Download failed"; exit 1 }
-          Write-Host "✅ LibreOffice MSI downloaded ($((Get-Item $out).Length / 1MB -as [int]) MB)"
-          # Try to extract MSI contents to portable folder — this often fails on GitHub runners
-          $extractDir = "installers\libreoffice\portable"
-          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-          $extracted = $false
-          Write-Host "Extracting LibreOffice to portable folder..."
-          try {
-            $proc = Start-Process -FilePath "msiexec" -ArgumentList "/a `"$out`" TARGETDIR=`"$extractDir`" /quiet" -Wait -PassThru -NoNewWindow -ErrorAction Stop
-            if ($proc.ExitCode -eq 0 -and (Test-Path "$extractDir\program\soffice.exe")) {
-              Write-Host "✅ LibreOffice extracted to portable folder"
-              $extracted = $true
-            } else {
-              Write-Host "⚠️  msiexec /a exit code: $($proc.ExitCode) — trying direct xcopy extraction..."
-            }
-          } catch {
-            Write-Host "⚠️  LibreOffice extraction error: $_ — trying direct xcopy extraction..."
-          }
-          # Fallback: use lessmsi or direct MSI extraction
-          if (-not $extracted) {
-            try {
-              # Try 7zip extraction of MSI (CAB files inside)
-              $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
-              if (Test-Path $sevenZip) {
-                Write-Host "Extracting MSI with 7zip..."
-                & $sevenZip x "$out" -o"$extractDir" -y * 2>&1 | Out-Null
-                # For MSI, CAB files contain the payload. Extract those too.
-                Get-ChildItem "$extractDir" -Filter "*.cab" | ForEach-Object {
-                  & $sevenZip x $_.FullName -o"$extractDir" -y * 2>&1 | Out-Null
-                }
-                if (Test-Path "$extractDir\program\soffice.exe") {
-                  Write-Host "✅ LibreOffice extracted via 7zip"
-                  $extracted = $true
-                }
-              } else {
-                Write-Host "7-Zip not found at $sevenZip, creating placeholder"
-              }
-            } catch {
-              Write-Host "⚠️  7zip extraction also failed: $_"
-            }
-          }
-          # If all extraction methods failed, create a dummy soffice.exe placeholder
-          # so the Inno Setup compiler doesn't error on the wildcard path.
-          # LibreOffice functionality will be unavailable until user installs it.
-          if (-not $extracted) {
-            Write-Host "⚠️  Creating placeholder for LibreOffice — installer will build without PDF conversion support"
-            New-Item -ItemType Directory -Force -Path "$extractDir\program" | Out-Null
-            # Create a README so user knows why it's missing
-            Set-Content -Path "$extractDir\README.txt" -Value "LibreOffice was not bundled in this build.`r`nThe server will work but Office-to-PDF conversion requires LibreOffice to be installed separately."
-          }
+          $dir = "installers\libreoffice\portable"
+          New-Item -ItemType Directory -Force -Path "$dir\program" | Out-Null
+          "LibreOffice was NOT bundled in this build." | Out-File "$dir\README.txt" -Encoding utf8
+          "Download it from https://www.libreoffice.org/download/" | Add-Content "$dir\README.txt"
+          "Extract MSI into C:\Program Files\USB Filesystem\Admin\libreoffice" | Add-Content "$dir\README.txt"
+          "Or install normally - server auto-detects" | Add-Content "$dir\README.txt"
+          Write-Host "LibreOffice folder prepared - user installs manually"
 
       - name: Create Admin Installer
         shell: cmd
