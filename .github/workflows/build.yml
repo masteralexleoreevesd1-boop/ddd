@@ -1,0 +1,358 @@
+name: Build ROCCA DCO Apps
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build + Sign + Package
+    runs-on: windows-latest
+    env:
+      APP_VERSION: ""
+
+    steps:
+      # This repo only contains the workflow — actual source is on origin
+      - name: Checkout source from 1st repo
+        uses: actions/checkout@v4
+        with:
+          repository: Alex-Leo-Reeves/Rocca-DCO-Filesystem
+          token: ${{ secrets.PAT_ORIGIN }}
+          path: source
+
+      - name: Move source to root
+        shell: pwsh
+        run: |
+          Move-Item -Path "source/*" -Destination . -Force
+          Move-Item -Path "source/.*" -Destination . -Force -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force source -ErrorAction SilentlyContinue
+
+      # --- Setup tools ---
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          flutter-version: '3.x'
+
+      - name: Enable Windows Desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Download Node.js MSI if missing or LFS pointer
+        shell: pwsh
+        run: |
+          $nodeMsi = "installers\nodejs\node-v22.14.0-x64.msi"
+          New-Item -ItemType Directory -Force -Path (Split-Path $nodeMsi) | Out-Null
+          $download = $true
+          if (Test-Path $nodeMsi) {
+            if ((Get-Item $nodeMsi).Length -gt 1MB) {
+              $download = $false
+            }
+          }
+          if ($download) {
+            Write-Host "Downloading Node.js MSI..."
+            Invoke-WebRequest -Uri "https://nodejs.org/dist/v22.14.0/node-v22.14.0-x64.msi" -OutFile $nodeMsi -UseBasicParsing
+          }
+
+      # ============================
+      # GENERATE CODE SIGNING CERT
+      # ============================
+      - name: Generate signing certificate
+        shell: pwsh
+        run: |
+          $CertName = "ROCCA DCO Filesystem"
+          $PfxPath = "installers\RoccaDCO.pfx"
+          $CerPath = "installers\RoccaDCO.cer"
+
+          $existing = Get-ChildItem -Path "Cert:\CurrentUser\My" | Where-Object { $_.Subject -eq "CN=$CertName" }
+          if (-not $existing) {
+            Write-Host "Creating code signing certificate..."
+            $cert = New-SelfSignedCertificate `
+              -Type Custom `
+              -Subject "CN=Ozegbe Mike Isioma, O=Rocca DCO, C=NG" `
+              -FriendlyName $CertName `
+              -CertStoreLocation "Cert:\CurrentUser\My" `
+              -NotAfter (Get-Date).AddYears(5) `
+              -KeyUsage DigitalSignature `
+              -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
+            $password = ConvertTo-SecureString -String "RoccaDCO2024" -Force -AsPlainText
+            Export-PfxCertificate -Cert $cert -FilePath $PfxPath -Password $password | Out-Null
+            Export-Certificate -Cert $cert -FilePath $CerPath -Type CERT | Out-Null
+            Write-Host "Certificate created: $CerPath"
+          } else {
+            Write-Host "Using existing certificate"
+          }
+
+      # ============================
+      # BUILD: Admin App
+      # ============================
+      - name: Clean and get dependencies (Admin App)
+        run: |
+          if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
+          flutter clean
+          flutter pub get
+        working-directory: admin_app
+        shell: pwsh
+
+      - name: Build Admin App (Windows)
+        run: flutter build windows --release
+        working-directory: admin_app
+
+      # ============================
+      # BUILD: User App
+      # ============================
+      - name: Clean and get dependencies (User App)
+        run: |
+          if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
+          if (Test-Path ".dart_tool") { Remove-Item -Recurse -Force ".dart_tool" }
+          flutter clean
+          flutter pub get
+        working-directory: user_app
+        shell: pwsh
+
+      - name: Analyze (User App)
+        run: flutter analyze --no-pub --no-fatal-infos --no-fatal-warnings
+        working-directory: user_app
+        continue-on-error: true
+
+      - name: Build User App (Windows)
+        run: flutter build windows --release
+        working-directory: user_app
+
+      # ============================
+      # BUILD: Server Core
+      # ============================
+      - name: Install server dependencies (sql.js primary — no native compilation)
+        run: npm install
+        working-directory: server_core
+
+      # ============================
+      # SIGN + COPY: Admin App (must come BEFORE server_core staging)
+      # ============================
+      - name: Sign and stage Admin app
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path installers/admin_release
+          $paths = @(
+            "admin_app/build/windows/runner/Release",
+            "admin_app/build/windows/x64/runner/Release"
+          )
+          $exePath = $null
+          foreach ($p in $paths) {
+            $test = "$p/rocca_dco_admin.exe"
+            if (Test-Path $test) { $exePath = $test; break }
+          }
+          if (-not $exePath) { Write-Host "ERROR: Admin .exe not found!"; exit 1 }
+          Write-Host "Found at: $exePath"
+          $srcDir = Split-Path $exePath -Parent
+          Copy-Item -Recurse -Force -Path "$srcDir/*" -Destination "installers/admin_release/"
+          $cert = Get-ChildItem -Path "Cert:\CurrentUser\My" | Where-Object { $_.Subject -like "*Ozegbe Mike Isioma*" }
+          if ($cert) {
+            Set-AuthenticodeSignature -FilePath $exePath -Certificate $cert -TimestampServer "http://timestamp.digicert.com" -HashAlgorithm SHA256
+            Write-Host "✅ Admin exe signed"
+          }
+
+      # ============================
+      # STAGE: Copy server_core WITH node_modules
+      # ============================
+      - name: Stage server_core for installer
+        shell: pwsh
+        run: |
+          $target = "installers\admin_release\server_core"
+          New-Item -ItemType Directory -Force -Path "$target\src" | Out-Null
+          Copy-Item -Recurse -Force "server_core\package.json" "$target\package.json"
+          Copy-Item -Recurse -Force "server_core\package-lock.json" "$target\package-lock.json"
+          Copy-Item -Recurse -Force "server_core\src\*" "$target\src\"
+          Write-Host "Copying node_modules (this may take a minute)..."
+          Copy-Item -Recurse -Force "server_core\node_modules" "$target\node_modules"
+          if (Test-Path "$target\node_modules\.bin") {
+            Remove-Item -Recurse -Force "$target\node_modules\.bin"
+          }
+          Get-ChildItem -Path "$target\node_modules" -Recurse -Directory -Filter ".git" -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue
+          }
+          if (Test-Path "$target\src\index.js") {
+            Write-Host "✅ Server core staged (with node_modules)"
+          } else {
+            Write-Host "❌ ERROR: server_core\src\index.js not found after staging!"
+            exit 1
+          }
+
+      - name: Download Ghostscript installer
+        shell: pwsh
+        run: |
+          $url = "https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10071/gs10071w64.exe"
+          $out = "installers\ghostscript\ghostscript_setup.exe"
+          New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
+          Write-Host "Downloading Ghostscript..."
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          if (-not (Test-Path $out)) { Write-Host "❌ Download failed"; exit 1 }
+
+      - name: Download LibreOffice installer
+        shell: pwsh
+        run: |
+          $url = "https://download.documentfoundation.org/libreoffice/stable/26.2.4/win/x86_64/LibreOffice_26.2.4_Win_x86-64.msi"
+          $out = "installers\libreoffice\LibreOffice_26.2.4_Win_x86-64.msi"
+          New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
+          Write-Host "Downloading LibreOffice 26.2.4..."
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -TimeoutSec 300
+          if (-not (Test-Path $out)) { Write-Host "❌ Download failed"; exit 1 }
+          Write-Host "✅ LibreOffice MSI downloaded ($((Get-Item $out).Length / 1MB -as [int]) MB)"
+          # Try to extract MSI contents to portable folder — this often fails on GitHub runners
+          $extractDir = "installers\libreoffice\portable"
+          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+          $extracted = $false
+          Write-Host "Extracting LibreOffice to portable folder..."
+          try {
+            $proc = Start-Process -FilePath "msiexec" -ArgumentList "/a `"$out`" TARGETDIR=`"$extractDir`" /quiet" -Wait -PassThru -NoNewWindow -ErrorAction Stop
+            if ($proc.ExitCode -eq 0 -and (Test-Path "$extractDir\program\soffice.exe")) {
+              Write-Host "✅ LibreOffice extracted to portable folder"
+              $extracted = $true
+            } else {
+              Write-Host "⚠️  msiexec /a exit code: $($proc.ExitCode) — trying direct xcopy extraction..."
+            }
+          } catch {
+            Write-Host "⚠️  LibreOffice extraction error: $_ — trying direct xcopy extraction..."
+          }
+          # Fallback: use lessmsi or direct MSI extraction
+          if (-not $extracted) {
+            try {
+              # Try 7zip extraction of MSI (CAB files inside)
+              $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
+              if (Test-Path $sevenZip) {
+                Write-Host "Extracting MSI with 7zip..."
+                & $sevenZip x "$out" -o"$extractDir" -y * 2>&1 | Out-Null
+                # For MSI, CAB files contain the payload. Extract those too.
+                Get-ChildItem "$extractDir" -Filter "*.cab" | ForEach-Object {
+                  & $sevenZip x $_.FullName -o"$extractDir" -y * 2>&1 | Out-Null
+                }
+                if (Test-Path "$extractDir\program\soffice.exe") {
+                  Write-Host "✅ LibreOffice extracted via 7zip"
+                  $extracted = $true
+                }
+              } else {
+                Write-Host "7-Zip not found at $sevenZip, creating placeholder"
+              }
+            } catch {
+              Write-Host "⚠️  7zip extraction also failed: $_"
+            }
+          }
+          # If all extraction methods failed, create a dummy soffice.exe placeholder
+          # so the Inno Setup compiler doesn't error on the wildcard path.
+          # LibreOffice functionality will be unavailable until user installs it.
+          if (-not $extracted) {
+            Write-Host "⚠️  Creating placeholder for LibreOffice — installer will build without PDF conversion support"
+            New-Item -ItemType Directory -Force -Path "$extractDir\program" | Out-Null
+            # Create a README so user knows why it's missing
+            Set-Content -Path "$extractDir\README.txt" -Value "LibreOffice was not bundled in this build.`r`nThe server will work but Office-to-PDF conversion requires LibreOffice to be installed separately."
+          }
+
+      - name: Create Admin Installer
+        shell: cmd
+        run: iscc admin_installer.iss
+        working-directory: installers
+
+      # ============================
+      # SIGN + COPY: User App
+      # ============================
+      - name: Sign and stage User app
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path installers/user_release
+          $paths = @(
+            "user_app/build/windows/runner/Release",
+            "user_app/build/windows/x64/runner/Release"
+          )
+          $exePath = $null
+          foreach ($p in $paths) {
+            $test = "$p/rocca_dco_user.exe"
+            if (Test-Path $test) { $exePath = $test; break }
+          }
+          if (-not $exePath) { Write-Host "ERROR: User .exe not found!"; exit 1 }
+          Write-Host "Found at: $exePath"
+          $srcDir = Split-Path $exePath -Parent
+          Copy-Item -Recurse -Force -Path "$srcDir/*" -Destination "installers/user_release/"
+          $cert = Get-ChildItem -Path "Cert:\CurrentUser\My" | Where-Object { $_.Subject -like "*Ozegbe Mike Isioma*" }
+          if ($cert) {
+            Set-AuthenticodeSignature -FilePath $exePath -Certificate $cert -TimestampServer "http://timestamp.digicord.com" -HashAlgorithm SHA256
+            Write-Host "✅ User exe signed"
+          }
+
+      - name: Create User Installer
+        shell: cmd
+        run: iscc user_installer.iss
+        working-directory: installers
+
+      # ============================
+      # DETECT VERSION & SIGN INSTALLERS
+      # ============================
+      - name: Detect version
+        shell: pwsh
+        run: |
+          $configPath = "server_core\src\config.js"
+          $version = "1.3.0" # fallback
+          if (Test-Path $configPath) {
+            $content = Get-Content $configPath -Raw
+            $match = [regex]::Match($content, "APP_VERSION:\s*'([\d.]+)'")
+            if ($match.Success) { $version = $match.Groups[1].Value }
+          }
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "✅ Detected version: $version"
+
+      - name: Sign the installers
+        shell: pwsh
+        run: |
+          Write-Host "Using version: $env:APP_VERSION"
+          $cert = Get-ChildItem -Path "Cert:\CurrentUser\My" | Where-Object { $_.Subject -like "*Ozegbe Mike Isioma*" }
+          if ($cert) {
+            $installers = @(
+              "dist/RoccaDCO_Admin_Setup_v$env:APP_VERSION.exe",
+              "dist/RoccaDCO_User_Setup_v$env:APP_VERSION.exe"
+            )
+            foreach ($exe in $installers) {
+              if (Test-Path $exe) {
+                Set-AuthenticodeSignature -FilePath $exe -Certificate $cert -TimestampServer "http://timestamp.digicord.com" -HashAlgorithm SHA256
+                Write-Host "✅ Signed installer: $exe"
+              } else {
+                Write-Host "⚠️  Not found (build may have failed): $exe"
+              }
+            }
+          }
+
+      # ============================
+      # UPLOAD
+      # ============================
+      - name: Upload Admin Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: RoccaDCO_Admin_Setup_v${{ env.APP_VERSION }}
+          path: dist/RoccaDCO_Admin_Setup_v${{ env.APP_VERSION }}.exe
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload User Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: RoccaDCO_User_Setup_v${{ env.APP_VERSION }}
+          path: dist/RoccaDCO_User_Setup_v${{ env.APP_VERSION }}.exe
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload Certificate
+        uses: actions/upload-artifact@v4
+        with:
+          name: RoccaDCO.cer
+          path: installers/RoccaDCO.cer
+          compression-level: 0
