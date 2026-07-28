@@ -199,64 +199,150 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
           if (-not (Test-Path $out)) { Write-Host "❌ Download failed"; exit 1 }
 
+      # ============================
+      # ROBUST LibreOffice download with retries + mirrors + fallbacks
+      # ============================
       - name: Download LibreOffice installer
         shell: pwsh
         run: |
-          $url = "https://download.documentfoundation.org/libreoffice/stable/26.2.4/win/x86_64/LibreOffice_26.2.4_Win_x86-64.msi"
+          $ErrorActionPreference = 'Continue'
+
           $out = "installers\libreoffice\LibreOffice_26.2.4_Win_x86-64.msi"
-          New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
-          Write-Host "Downloading LibreOffice 26.2.4..."
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -TimeoutSec 300
-          if (-not (Test-Path $out)) { Write-Host "❌ Download failed"; exit 1 }
-          Write-Host "✅ LibreOffice MSI downloaded ($((Get-Item $out).Length / 1MB -as [int]) MB)"
-          # Try to extract MSI contents to portable folder — this often fails on GitHub runners
           $extractDir = "installers\libreoffice\portable"
-          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+          New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
+          New-Item -ItemType Directory -Force -Path "$extractDir\program" | Out-Null
+
+          # Primary + mirrors
+          $urls = @(
+            "https://download.documentfoundation.org/libreoffice/stable/26.2.4/win/x86_64/LibreOffice_26.2.4_Win_x86-64.msi",
+            "https://mirror.ibcp.fr/pub/tdf/libreoffice/stable/26.2.4/win/x86_64/LibreOffice_26.2.4_Win_x86-64.msi",
+            "https://ftp.yz.yamagata-u.ac.jp/pub/network/misc/tdf/libreoffice/stable/26.2.4/win/x86_64/LibreOffice_26.2.4_Win_x86-64.msi",
+            "https://mirror.aarnet.edu.au/pub/tdf/libreoffice/stable/26.2.4/win/x86_64/LibreOffice_26.2.4_Win_x86-64.msi",
+            "https://mirrors.dotsrc.org/tdf/libreoffice/stable/26.2.4/win/x86_64/LibreOffice_26.2.4_Win_x86-64.msi"
+          )
+
+          $downloaded = $false
           $extracted = $false
-          Write-Host "Extracting LibreOffice to portable folder..."
-          try {
-            $proc = Start-Process -FilePath "msiexec" -ArgumentList "/a `"$out`" TARGETDIR=`"$extractDir`" /quiet" -Wait -PassThru -NoNewWindow -ErrorAction Stop
-            if ($proc.ExitCode -eq 0 -and (Test-Path "$extractDir\program\soffice.exe")) {
-              Write-Host "✅ LibreOffice extracted to portable folder"
-              $extracted = $true
-            } else {
-              Write-Host "⚠️  msiexec /a exit code: $($proc.ExitCode) — trying direct xcopy extraction..."
+
+          # ========== DOWNLOAD with retries ==========
+          Write-Host "=== Downloading LibreOffice 26.2.4 ==="
+
+          :outer foreach ($url in $urls) {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              Write-Host "Attempt $attempt/3 — $url"
+              try {
+                # Method A: Invoke-WebRequest
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                Invoke-WebRequest -Uri $url -OutFile "$out.tmp" -UseBasicParsing -TimeoutSec 300 -ErrorAction Stop
+                if ((Get-Item "$out.tmp").Length -gt 10MB) {
+                  Move-Item -Force "$out.tmp" $out
+                  Write-Host "✅ Downloaded ($((Get-Item $out).Length / 1MB -as [int]) MB)"
+                  $downloaded = $true
+                  break outer
+                } else {
+                  Write-Host "⚠️  File too small ($((Get-Item "$out.tmp").Length) bytes), trying next..."
+                  Remove-Item "$out.tmp" -Force -ErrorAction SilentlyContinue
+                }
+              } catch {
+                Write-Host "⚠️  Invoke-WebRequest failed: $($_.Exception.Message)"
+                Remove-Item "$out.tmp" -Force -ErrorAction SilentlyContinue
+              }
+
+              # Method B: curl.exe fallback
+              try {
+                $curl = Get-Command "curl.exe" -ErrorAction Stop
+                Write-Host "Trying curl.exe..."
+                & $curl -L -o "$out.tmp" --connect-timeout 60 --max-time 600 $url 2>&1 | Out-Null
+                if ((Test-Path "$out.tmp") -and ((Get-Item "$out.tmp").Length -gt 10MB)) {
+                  Move-Item -Force "$out.tmp" $out
+                  Write-Host "✅ Downloaded via curl ($((Get-Item $out).Length / 1MB -as [int]) MB)"
+                  $downloaded = $true
+                  break outer
+                } else {
+                  Remove-Item "$out.tmp" -Force -ErrorAction SilentlyContinue
+                }
+              } catch {
+                Write-Host "⚠️  curl.exe not available or failed"
+                Remove-Item "$out.tmp" -Force -ErrorAction SilentlyContinue
+              }
+
+              # Method C: Start-BitsTransfer
+              try {
+                Write-Host "Trying Start-BitsTransfer..."
+                Start-BitsTransfer -Source $url -Destination "$out.tmp" -Asynchronous -Priority High -ErrorAction Stop
+                # Wait for BITS job
+                $job = Get-BitsTransfer | Where-Object { $_.JobState -ne "Transferred" -and $_.JobState -ne "Error" } | Select-Object -First 1
+                if ($job) { Complete-BitsTransfer -BitsJob $job }
+                if ((Test-Path "$out.tmp") -and ((Get-Item "$out.tmp").Length -gt 10MB)) {
+                  Move-Item -Force "$out.tmp" $out
+                  Write-Host "✅ Downloaded via BITS ($((Get-Item $out).Length / 1MB -as [int]) MB)"
+                  $downloaded = $true
+                  break outer
+                } else {
+                  Remove-Item "$out.tmp" -Force -ErrorAction SilentlyContinue
+                }
+              } catch {
+                Write-Host "⚠️  BITS transfer failed"
+                Remove-Item "$out.tmp" -Force -ErrorAction SilentlyContinue
+              }
+
+              if ($attempt -lt 3) {
+                $wait = $attempt * 10
+                Write-Host "Waiting ${wait}s before retry..."
+                Start-Sleep -Seconds $wait
+              }
             }
-          } catch {
-            Write-Host "⚠️  LibreOffice extraction error: $_ — trying direct xcopy extraction..."
           }
-          # Fallback: use lessmsi or direct MSI extraction
-          if (-not $extracted) {
+
+          # ========== EXTRACTION (only if MSI downloaded) ==========
+          if ($downloaded) {
+            Write-Host "=== Extracting LibreOffice to portable folder ==="
+            # Method 1: msiexec /a
             try {
-              # Try 7zip extraction of MSI (CAB files inside)
-              $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
-              if (Test-Path $sevenZip) {
-                Write-Host "Extracting MSI with 7zip..."
-                & $sevenZip x "$out" -o"$extractDir" -y * 2>&1 | Out-Null
-                # For MSI, CAB files contain the payload. Extract those too.
-                Get-ChildItem "$extractDir" -Filter "*.cab" | ForEach-Object {
-                  & $sevenZip x $_.FullName -o"$extractDir" -y * 2>&1 | Out-Null
-                }
-                if (Test-Path "$extractDir\program\soffice.exe") {
-                  Write-Host "✅ LibreOffice extracted via 7zip"
-                  $extracted = $true
-                }
-              } else {
-                Write-Host "7-Zip not found at $sevenZip, creating placeholder"
+              $proc = Start-Process -FilePath "msiexec" -ArgumentList "/a `"$out`" TARGETDIR=`"$extractDir`" /quiet" -Wait -PassThru -NoNewWindow -ErrorAction Stop
+              if ($proc.ExitCode -eq 0 -and (Test-Path "$extractDir\program\soffice.exe")) {
+                Write-Host "✅ LibreOffice extracted via msiexec /a"
+                $extracted = $true
               }
             } catch {
-              Write-Host "⚠️  7zip extraction also failed: $_"
+              Write-Host "⚠️  msiexec /a failed: $_"
+            }
+
+            # Method 2: 7zip fallback
+            if (-not $extracted) {
+              try {
+                $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
+                if (Test-Path $sevenZip) {
+                  Write-Host "Extracting MSI with 7zip..."
+                  & $sevenZip x "$out" -o"$extractDir" -y * 2>&1 | Out-Null
+                  Get-ChildItem "$extractDir" -Filter "*.cab" | ForEach-Object {
+                    & $sevenZip x $_.FullName -o"$extractDir" -y * 2>&1 | Out-Null
+                  }
+                  if (Test-Path "$extractDir\program\soffice.exe") {
+                    Write-Host "✅ LibreOffice extracted via 7zip"
+                    $extracted = $true
+                  }
+                } else {
+                  Write-Host "7-Zip not found at $sevenZip"
+                }
+              } catch {
+                Write-Host "⚠️  7zip extraction also failed: $_"
+              }
             }
           }
-          # If all extraction methods failed, create a dummy soffice.exe placeholder
-          # so the Inno Setup compiler doesn't error on the wildcard path.
-          # LibreOffice functionality will be unavailable until user installs it.
-          if (-not $extracted) {
-            Write-Host "⚠️  Creating placeholder for LibreOffice — installer will build without PDF conversion support"
-            New-Item -ItemType Directory -Force -Path "$extractDir\program" | Out-Null
-            # Create a README so user knows why it's missing
-            Set-Content -Path "$extractDir\README.txt" -Value "LibreOffice was not bundled in this build.`r`nThe server will work but Office-to-PDF conversion requires LibreOffice to be installed separately."
+
+          # ========== FINAL: success or placeholder ==========
+          if ($extracted) {
+            Write-Host "🎉 LibreOffice successfully bundled!" -ForegroundColor Green
+          } else {
+            if ($downloaded) {
+              Write-Host "⚠️  MSI downloaded but extraction failed — keeping MSI for installer"
+              # Inno Setup's [Run] section will try to install it at end-user time
+            } else {
+              Write-Host "⚠️  LibreOffice could not be downloaded from any mirror — installer will build without PDF conversion support"
+              if (Test-Path $out) { Remove-Item -Force $out -ErrorAction SilentlyContinue }
+              Set-Content -Path "$extractDir\README.txt" -Value "LibreOffice was not bundled in this build.`r`nThe server will work but Office-to-PDF conversion requires LibreOffice to be installed separately."
+            }
           }
 
       - name: Create Admin Installer
@@ -286,7 +372,7 @@ jobs:
           Copy-Item -Recurse -Force -Path "$srcDir/*" -Destination "installers/user_release/"
           $cert = Get-ChildItem -Path "Cert:\CurrentUser\My" | Where-Object { $_.Subject -like "*Ozegbe Mike Isioma*" }
           if ($cert) {
-            Set-AuthenticodeSignature -FilePath $exePath -Certificate $cert -TimestampServer "http://timestamp.digicord.com" -HashAlgorithm SHA256
+            Set-AuthenticodeSignature -FilePath $exePath -Certificate $cert -TimestampServer "http://timestamp.digicert.com" -HashAlgorithm SHA256
             Write-Host "✅ User exe signed"
           }
 
@@ -323,7 +409,7 @@ jobs:
             )
             foreach ($exe in $installers) {
               if (Test-Path $exe) {
-                Set-AuthenticodeSignature -FilePath $exe -Certificate $cert -TimestampServer "http://timestamp.digicord.com" -HashAlgorithm SHA256
+                Set-AuthenticodeSignature -FilePath $exe -Certificate $cert -TimestampServer "http://timestamp.digicert.com" -HashAlgorithm SHA256
                 Write-Host "✅ Signed installer: $exe"
               } else {
                 Write-Host "⚠️  Not found (build may have failed): $exe"
