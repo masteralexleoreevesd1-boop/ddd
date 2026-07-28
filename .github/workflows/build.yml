@@ -188,11 +188,15 @@ jobs:
             exit 1
           }
 
+      # ============================
+      # Download Ghostscript — MUST match filename in admin_installer.iss
+      # .iss expects: ghostscript\gs10071w64.exe
+      # ============================
       - name: Download Ghostscript installer
         shell: pwsh
         run: |
           $url = "https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10071/gs10071w64.exe"
-          $out = "installers\ghostscript\ghostscript_setup.exe"
+          $out = "installers\ghostscript\gs10071w64.exe"
           New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
           Write-Host "Downloading Ghostscript..."
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -270,7 +274,6 @@ jobs:
               try {
                 Write-Host "Trying Start-BitsTransfer..."
                 Start-BitsTransfer -Source $url -Destination "$out.tmp" -Asynchronous -Priority High -ErrorAction Stop
-                # Wait for BITS job
                 $job = Get-BitsTransfer | Where-Object { $_.JobState -ne "Transferred" -and $_.JobState -ne "Error" } | Select-Object -First 1
                 if ($job) { Complete-BitsTransfer -BitsJob $job }
                 if ((Test-Path "$out.tmp") -and ((Get-Item "$out.tmp").Length -gt 10MB)) {
@@ -337,7 +340,6 @@ jobs:
           } else {
             if ($downloaded) {
               Write-Host "⚠️  MSI downloaded but extraction failed — keeping MSI for installer"
-              # Inno Setup's [Run] section will try to install it at end-user time
             } else {
               Write-Host "⚠️  LibreOffice could not be downloaded from any mirror — installer will build without PDF conversion support"
               if (Test-Path $out) { Remove-Item -Force $out -ErrorAction SilentlyContinue }
