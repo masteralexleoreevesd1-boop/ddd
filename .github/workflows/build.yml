@@ -163,7 +163,7 @@ jobs:
           }
 
       # ============================
-      # STAGE: Copy server_core WITH node_modules
+      # STAGE: Copy server_core WITH node_modules AND start.bat
       # ============================
       - name: Stage server_core for installer
         shell: pwsh
@@ -173,6 +173,13 @@ jobs:
           Copy-Item -Recurse -Force "server_core\package.json" "$target\package.json"
           Copy-Item -Recurse -Force "server_core\package-lock.json" "$target\package-lock.json"
           Copy-Item -Recurse -Force "server_core\src\*" "$target\src\"
+          # Copy start.bat so the splash screen can launch the server via batch file
+          if (Test-Path "server_core\start.bat") {
+            Copy-Item -Force "server_core\start.bat" "$target\start.bat"
+            Write-Host "✅ start.bat staged"
+          } else {
+            Write-Host "⚠️  start.bat not found in server_core root"
+          }
           Write-Host "Copying node_modules (this may take a minute)..."
           Copy-Item -Recurse -Force "server_core\node_modules" "$target\node_modules"
           if (Test-Path "$target\node_modules\.bin") {
@@ -182,7 +189,7 @@ jobs:
             Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue
           }
           if (Test-Path "$target\src\index.js") {
-            Write-Host "✅ Server core staged (with node_modules)"
+            Write-Host "✅ Server core staged (with node_modules + start.bat)"
           } else {
             Write-Host "❌ ERROR: server_core\src\index.js not found after staging!"
             exit 1
