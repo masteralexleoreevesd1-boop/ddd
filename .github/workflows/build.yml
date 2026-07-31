@@ -48,21 +48,49 @@ jobs:
       - name: Install Inno Setup
         run: choco install innosetup -y
 
-      - name: Download Node.js MSI if missing or LFS pointer
+      - name: Download and stage portable Node.js runtime
         shell: pwsh
         run: |
-          $nodeMsi = "installers\nodejs\node-v22.14.0-x64.msi"
-          New-Item -ItemType Directory -Force -Path (Split-Path $nodeMsi) | Out-Null
+          # I19: stage the FULL portable Node.js runtime so the admin installer
+          # bundles {app}\nodejs\node.exe + {app}\nodejs\portable\npm.cmd.
+          # The server then runs EXCLUSIVELY on the bundled runtime (start.bat
+          # prefers node.exe; the splash derives npm.cmd from the same folder),
+          # so no system-wide Node install is required.
+          $nodeDir = "installers\nodejs"
+          New-Item -ItemType Directory -Force -Path $nodeDir | Out-Null
+          $zip = "$nodeDir\node-v22.14.0-win-x64.zip"
           $download = $true
-          if (Test-Path $nodeMsi) {
-            if ((Get-Item $nodeMsi).Length -gt 1MB) {
+          if (Test-Path $zip) {
+            if ((Get-Item $zip).Length -gt 10MB) {
               $download = $false
             }
           }
           if ($download) {
-            Write-Host "Downloading Node.js MSI..."
-            Invoke-WebRequest -Uri "https://nodejs.org/dist/v22.14.0/node-v22.14.0-x64.msi" -OutFile $nodeMsi -UseBasicParsing
+            Write-Host "Downloading portable Node.js v22.14.0 ZIP..."
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri "https://nodejs.org/dist/v22.14.0/node-v22.14.0-win-x64.zip" -OutFile $zip -UseBasicParsing
+            if (-not (Test-Path $zip)) { Write-Host "❌ Node.js ZIP download failed"; exit 1 }
           }
+
+          # Extract the full portable runtime (node.exe + npm.cmd + node_modules\npm)
+          $extractTo = "$nodeDir\portable"
+          if (Test-Path $extractTo) { Remove-Item -Recurse -Force $extractTo }
+          Expand-Archive -Path $zip -DestinationPath $extractTo -Force
+          # Flatten the versioned wrapper folder (node-v22.14.0-win-x64) into portable\
+          $inner = Get-ChildItem -Path $extractTo -Directory | Select-Object -First 1
+          if ($inner) {
+            Get-ChildItem -Path $inner.FullName | ForEach-Object {
+              Move-Item -Force $_.FullName $extractTo
+            }
+            Remove-Item -Recurse -Force $inner.FullName
+          }
+          if (-not (Test-Path "$extractTo\node.exe")) { Write-Host "❌ node.exe missing after extraction"; exit 1 }
+          if (-not (Test-Path "$extractTo\npm.cmd")) { Write-Host "❌ npm.cmd missing after extraction"; exit 1 }
+
+          # Copy node.exe to the legacy/expected location too (start.bat + splash both check it)
+          Copy-Item -Force "$extractTo\node.exe" "$nodeDir\node.exe"
+          Write-Host "✅ Portable Node.js staged: $nodeDir\node.exe + portable\npm.cmd"
+          # The ZIP is kept cached in CI for rebuilds.
 
       # ============================
       # GENERATE CODE SIGNING CERT
@@ -339,6 +367,39 @@ jobs:
                 Write-Host "⚠️  7zip extraction also failed: $_"
               }
             }
+          }
+
+          # ========== I20: TRIM the portable tree (multi-language/help/samples) ==========
+          # The full extracted tree is ~1.5 GB; the bundled installer only ships
+          # English. Removing help packs, samples, templates, extensions and
+          # non-English locales keeps the portable bundle a fraction of the size.
+          # office.js launches {app}\libreoffice\program\soffice.exe --headless
+          # with flags that work identically on the trimmed tree.
+          if ($extracted) {
+            Write-Host "Trimming portable LibreOffice (I20)..." -ForegroundColor Yellow
+            $trimDirs = @(
+              "$extractDir\share\help",
+              "$extractDir\share\samples",
+              "$extractDir\share\template",
+              "$extractDir\share\templates",
+              "$extractDir\share\extensions",
+              "$extractDir\share\config",
+              "$extractDir\program\resource\help",
+              "$extractDir\program\lib\liblangpack*"
+            )
+            foreach ($d in $trimDirs) {
+              if (Test-Path $d) { Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue }
+            }
+            $resLocaleDir = "$extractDir\program\resources"
+            if (Test-Path $resLocaleDir) {
+              Get-ChildItem -Path $resLocaleDir -Directory | Where-Object { $_.Name -notmatch '^(en|en-US|en_US|qtz)$' } | ForEach-Object {
+                Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue
+              }
+            }
+            # Remove the big unneeded MSI payload pieces extracted by msiexec /a
+            Remove-Item -Recurse -Force "$extractDir\Windows" -ErrorAction SilentlyContinue
+            Remove-Item -Recurse -Force "$extractDir\Source" -ErrorAction SilentlyContinue
+            Write-Host "  ✅ Trimmed (final size: $(((Get-ChildItem -Recurse -File $extractDir | Measure-Object -Property Length -Sum).Sum / 1MB) -as [int]) MB)" -ForegroundColor Green
           }
 
           # ========== FINAL: success or placeholder ==========
